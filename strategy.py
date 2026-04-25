@@ -70,19 +70,31 @@ class Strategy:
             return []
 
     def evaluate_leader(self, row, hist_df):
-        """龙头评分"""
+        """龙头评分 - 整合 leader-stock-identification 技能增强"""
         try:
-            from evolved_trading_system import LeaderFilter
+            from evolved_trading_system import LeaderFilter, TI
             stock_dict = {
                 'turnoverratio': float(row.get('换手', 0)),
                 'changepercent': float(row.get('涨幅', 0)),
                 'volume': float(row.get('成交量', 0)),
             }
             kline = self._df_to_kline(hist_df) if hist_df is not None and not hist_df.empty else None
-            return LeaderFilter.evaluate(stock_dict, kline)
+            
+            # 计算技术评分 (-5~+5) 传给 LeaderFilter 做加成
+            tech_score_ev = 0
+            if kline and len(kline) >= 35:
+                closes = [d['close'] for d in kline]
+                try:
+                    tech_score_ev, _ = TI.kline_score(kline, closes)
+                except Exception:
+                    pass
+            
+            result = LeaderFilter.evaluate(stock_dict, kline, tech_score=tech_score_ev)
+            result['tech_score_ev'] = tech_score_ev  # 附加，供上层使用
+            return result
         except Exception as e:
             print(f"[龙头评分] 异常: {e}")
-            return {'score': 0, 'grade': '⚪ 未评级', 'reasons': []}
+            return {'score': 0, 'grade': '⚪ 未评级', 'reasons': [], 'tech_score_ev': 0}
 
     def market_filter(self, sentiment: Dict) -> Tuple[bool, str]:
         """大盘情绪过滤"""
@@ -131,14 +143,25 @@ class Strategy:
         return 'oscillation', score, f'震荡模式(score={score})'
 
     def _detect_sentiment_cycle(self, sentiment: Dict) -> str:
-        """情绪周期识别：冰点/回暖/高潮/退潮"""
+        """情绪周期识别：冰点/回暖/分歧/高潮/退潮
+        整合 market-sentiment 技能：加入炸板率 + 冰点/回暖/分歧/亢奋四阶段
+        """
         limit_up = sentiment.get('limit_up', 0)
         limit_down = sentiment.get('limit_down', 0)
         up_ratio = sentiment.get('up_ratio', 0.5)
+        # 炸板率: 如果有涨停尝试数据则计算, 否则用涨停/跌停比近似
+        zt_attempt = sentiment.get('limit_up_attempt', 0)
+        if zt_attempt > 0 and limit_up > 0:
+            zhaban_rate = zt_attempt / (limit_up + zt_attempt) * 100
+        else:
+            zhaban_rate = 0  # 无数据时不作为判断依据
 
+        # 四阶段判断 (market-sentiment 技能)
         if limit_up < self.cfg.get('sentiment_ice_limit_up_max', 30) or limit_down > 30:
             return '冰点'
-        if limit_up >= self.cfg.get('sentiment_hot_limit_up_min', 80) and up_ratio >= 0.6:
+        if zhaban_rate > 25:
+            return '分歧'  # 炸板率高: 多空分歧大
+        if limit_up >= self.cfg.get('sentiment_hot_limit_up_min', 80) and up_ratio >= 0.6 and zhaban_rate < 15:
             return '高潮'
         if limit_up <= self.cfg.get('sentiment_warm_limit_up_max', 60):
             return '回暖'
@@ -173,8 +196,8 @@ class Strategy:
             return False
 
         formula_text = ' '.join(formulas)
-        if sentiment_cycle == '退潮':
-            return False
+        if sentiment_cycle in ('退潮', '分歧'):
+            return False  # 退潮/分歧期不参与
         if market_mode == 'defense':
             return '背离' in formula_text
         if market_mode == 'oscillation':
@@ -429,7 +452,8 @@ class Strategy:
                     from uzi_integration import quick_uzi_score
                     uzi_boost, uzi_signal, uzi_reasons = quick_uzi_score(
                         code, name, self._df_to_kline(hist) if not hist.empty else [],
-                        {'换手': float(row.get('换手', 0)), '总市值': float(row.get('总市值', 0))}
+                        {'换手': float(row.get('换手', 0)), '总市值': float(row.get('总市值', 0))},
+                        market_sentiment=sentiment  # 传递市场情绪数据用于 UZI 情绪温度计算
                     )
                     uzi_bonus = uzi_boost
                     if uzi_reasons:
@@ -444,12 +468,22 @@ class Strategy:
                     formula_bonus = len(formula_sigs) * formula_weight
                     tech_reasons.append(f"触发{len(formula_sigs)}套公式: {', '.join(formula_names)}")
 
-                # 龙头加分
+                # 龙头加分 (整合 leader-stock-identification 技能)
                 leader_bonus = 0
                 if leader['score'] >= 3:
                     leader_weight = cfg.get('leader_weight', 2)
                     leader_bonus = leader['score'] * leader_weight
                     tech_reasons.append(f"龙头: {leader['grade']} ({', '.join(leader['reasons'][:2])})")
+                
+                # 技术评分加成 (来自 a-stock-kline-analyzer 的 TI.kline_score)
+                tech_ev_bonus = 0
+                tech_ev = leader.get('tech_score_ev', 0)
+                if tech_ev >= 3:
+                    tech_ev_bonus = 3
+                    tech_reasons.append(f"技术评分强({tech_ev:+.1f})")
+                elif tech_ev >= 1.5:
+                    tech_ev_bonus = 1.5
+                    tech_reasons.append(f"技术评分偏多({tech_ev:+.1f})")
 
                 gate_ok, reds, yellows, greens = self._tier_gate_pass(
                     row, tech_score, fund_score, formula_names, leader, market_mode
@@ -457,7 +491,7 @@ class Strategy:
                 if not gate_ok:
                     continue
 
-                total_score = tech_score + fund_score + sector_bonus + formula_bonus + leader_bonus + len(greens) + uzi_bonus
+                total_score = tech_score + fund_score + sector_bonus + formula_bonus + leader_bonus + len(greens) + uzi_bonus + tech_ev_bonus
                 threshold = cfg['buy_score_threshold_defense'] if market_mode == 'defense' else cfg['buy_score_threshold']
 
                 if total_score >= threshold:

@@ -4,6 +4,7 @@ A股虚拟短线交易系统 - 主程序
       python main.py report  # 生成每日报告
       python main.py init    # 初始化账户
       python main.py evolve  # 运行自进化分析
+      python main.py postmarket_pick  # 盘后选股+UZI深度分析
       python main.py test    # 测试数据连接和webhook
 """
 import sys
@@ -39,6 +40,11 @@ def run_evolve():
     """运行自进化分析"""
     executor = Executor()
     executor.run_evolution_only()
+
+def run_postmarket_pick():
+    """盘后选股：完整扫描 + UZI深度分析"""
+    executor = Executor()
+    executor.run_postmarket_pick()
 
 def run_test():
     """测试系统连通性"""
@@ -80,7 +86,7 @@ def run_test():
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='A股模拟交易系统')
-    parser.add_argument('command', choices=['scan', 'report', 'init', 'evolve', 'test'],
+    parser.add_argument('command', choices=['scan', 'report', 'init', 'evolve', 'postmarket_pick', 'test'],
                        help='执行命令: scan=扫描, report=报告, init=初始化, evolve=进化, test=测试')
     args = parser.parse_args()
 
@@ -92,5 +98,7 @@ if __name__ == "__main__":
         run_report()
     elif args.command == 'evolve':
         run_evolve()
+    elif args.command == 'postmarket_pick':
+        run_postmarket_pick()
     elif args.command == 'test':
         run_test()

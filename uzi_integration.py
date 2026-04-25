@@ -25,6 +25,8 @@ from dataclasses import dataclass
 from lib.investor_db import INVESTORS
 from lib.investor_evaluator import evaluate
 from lib.stock_features import extract_features
+from lib.market_router import parse_ticker
+from lib.data_sources import fetch_lhb_recent
 
 @dataclass
 class UZIScore:
@@ -62,8 +64,36 @@ class UZIAnalyzer:
         self.investors = INVESTORS
         self._group_map = {inv['id']: inv.get('group', '') for inv in self.investors}
 
-    def _build_raw_stub(self, code: str, name: str, kline: List[Dict], spot_row: Optional[Dict] = None) -> Dict:
-        """从我们的 kline + spot 数据构建 UZI raw_data stub"""
+    @staticmethod
+    def _fetch_kline_tencent(code: str, days: int = 60) -> List[Dict]:
+        """备用 K 线获取：从腾讯接口拉取日 K 线 (与 evolved_trading_system 相同数据源)"""
+        import urllib.request
+        market = 'sh' if code.startswith('6') else 'sz'
+        url = f"http://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={market}{code},day,,,{days},qfq"
+        try:
+            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                data = json.loads(resp.read().decode('utf-8'))
+            raw = data.get('data', {}).get(f'{market}{code}', {}).get('qfqday', [])
+            return [{'date': i[0], 'open': float(i[1]), 'close': float(i[2]),
+                     'low': float(i[3]), 'high': float(i[4]), 'volume': float(i[5])} for i in raw]
+        except Exception:
+            return []
+
+    def _build_raw_stub(self, code: str, name: str, kline: List[Dict], spot_row: Optional[Dict] = None,
+                        market_sentiment: Optional[Dict] = None) -> Dict:
+        """从我们的 kline + spot 数据构建 UZI raw_data stub
+
+        v2.0: 补全 16_lhb / 17_sentiment.thermometer_value / 7_industry
+        让 51 位评委（尤其游资组 F 组 23 人）能拿到足够数据打分
+
+        Args:
+            market_sentiment: 来自 data_feed.get_market_sentiment()，包含 limit_up/limit_down/up_ratio
+        """
+        # 如果没有 kline 数据，自动从腾讯接口获取
+        if not kline:
+            kline = self._fetch_kline_tencent(code, days=60)
+
         # 提取基本价格数据
         latest = kline[-1] if kline else {}
         prev = kline[-2] if len(kline) >= 2 else latest
@@ -106,7 +136,50 @@ class UZIAnalyzer:
         # 涨跌幅
         change_pct = ((latest.get('close', 0) - prev.get('close', 1)) / prev.get('close', 1) * 100) if prev.get('close') else 0
 
-        # 构建 raw_data stub
+        # 市值 (从 spot_row 或 kline 推算)
+        market_cap_raw = spot_row.get('总市值', 0) if spot_row else 0
+        if isinstance(market_cap_raw, (int, float)) and market_cap_raw > 0:
+            # 如果是亿元单位，转为元；如果已经很大，认为是元
+            market_cap_yuan = market_cap_raw * 1e8 if market_cap_raw < 1e6 else market_cap_raw
+        else:
+            market_cap_yuan = 0
+
+        # ── 新增: 16_lhb 龙虎榜数据 ──
+        lhb_count_30d = 0
+        lhb_records = []
+        try:
+            ti = parse_ticker(code)
+            lhb_records = fetch_lhb_recent(ti, days=30)
+            lhb_count_30d = len(lhb_records) if lhb_records else 0
+        except Exception:
+            pass  # 获取失败时 lhb_count_30d 保持 0
+
+        # ── 新增: 17_sentiment.thermometer_value ──
+        # 基于市场情绪数据计算情绪温度 (0-100)
+        # 涨停多/上涨比高 → 温度高，跌停多 → 温度低
+        up_ratio = 0.5
+        limit_up = 0
+        limit_down = 0
+        if market_sentiment:
+            up_ratio = float(market_sentiment.get('up_ratio', 0.5))
+            limit_up = float(market_sentiment.get('limit_up', 0))
+            limit_down = float(market_sentiment.get('limit_down', 0))
+        # 综合温度: 涨停贡献 + 上涨比贡献 - 跌停惩罚
+        thermometer = 50  # 基线
+        if limit_up > 0:
+            thermometer += min(limit_up / 5, 25)  # 涨停贡献最多25分
+        if limit_down > 0:
+            thermometer -= min(limit_down / 3, 20)  # 跌停扣分最多20分
+        thermometer += (up_ratio - 0.5) * 50  # 上涨比偏离0.5的部分
+        thermometer = max(0, min(100, round(thermometer, 1)))
+
+        # ── 新增: 7_industry 行业信息 ──
+        industry = "—"
+        industry_rank = 0
+        if spot_row:
+            industry = spot_row.get('行业', spot_row.get('板块', '—'))
+
+        # 构建 raw_data stub (v2.0: 补全关键维度)
         raw = {
             "ticker": code,
             "dimensions": {
@@ -115,7 +188,8 @@ class UZIAnalyzer:
                     "name": name,
                     "price": latest.get('close', 0),
                     "change_pct": round(change_pct, 2),
-                    "market_cap": spot_row.get('总市值', 0) * 1e8 if spot_row else 0,
+                    "market_cap": market_cap_yuan,
+                    "industry": industry,
                 }},
                 "2_kline": {"data": {
                     "stage": stage,
@@ -128,14 +202,22 @@ class UZIAnalyzer:
                         "ytd_return": self._ytd_return(closes),
                     }
                 }},
+                "7_industry": {"data": {
+                    "industry": industry,
+                    "industry_rank": industry_rank,
+                }},
                 "12_capital_flow": {"data": {
                     "main_force_ratio": spot_row.get('换手', 0) if spot_row else 0,
                     "net_inflow_yi": 0,
                 }},
+                "16_lhb": {"data": {
+                    "lhb_count_30d": lhb_count_30d,
+                }},
                 "17_sentiment": {"data": {
-                    "limit_up_count": 0,
-                    "limit_down_count": 0,
-                    "up_ratio": 0.5,
+                    "limit_up_count": limit_up,
+                    "limit_down_count": limit_down,
+                    "up_ratio": up_ratio,
+                    "thermometer_value": thermometer,
                 }},
             }
         }
@@ -189,13 +271,17 @@ class UZIAnalyzer:
             return 0
         return round((closes[-1] - closes[-60]) / closes[-60] * 100, 1) if closes[-60] else 0
 
-    def analyze_stock(self, code: str, name: str, kline: List[Dict], spot_row: Optional[Dict] = None) -> UZIScore:
+    def analyze_stock(self, code: str, name: str, kline: List[Dict], spot_row: Optional[Dict] = None,
+                      market_sentiment: Optional[Dict] = None) -> UZIScore:
         """
         对单只股票做 UZI 轻量级评审
         返回 UZIScore，包含给我们选股系统的加分建议
+
+        Args:
+            market_sentiment: 市场情绪数据 (limit_up/limit_down/up_ratio)
         """
         # 1. 构建 raw stub
-        raw = self._build_raw_stub(code, name, kline, spot_row)
+        raw = self._build_raw_stub(code, name, kline, spot_row, market_sentiment)
 
         # 2. 提取特征
         features = extract_features(raw, raw.get("dimensions", {}))
@@ -295,11 +381,74 @@ class UZIAnalyzer:
         return results
 
 
-def quick_uzi_score(code: str, name: str, kline: List[Dict], spot_row: Optional[Dict] = None) -> Tuple[float, str, List[str]]:
-    """快速获取 UZI 加分和理由（供 strategy.py 直接调用）"""
+def full_uzi_analysis(code: str, name: str, kline: List[Dict], spot_data: Optional[Dict] = None,
+                      market_sentiment: Optional[Dict] = None) -> Dict:
+    """UZI 全量深度分析（盘后选股用）
+    
+    返回完整分析结果，包含 verdict/score/details，供盘后选股决策
+    """
     try:
         analyzer = UZIAnalyzer()
-        result = analyzer.analyze_stock(code, name, kline, spot_row)
+        result = analyzer.analyze_stock(code, name, kline, spot_data, market_sentiment)
+        
+        # 根据评分和信号生成 verdict
+        overall = result.overall_score
+        boost = result.score_boost
+        tech_sig = result.tech_signal
+        youzi_sig = result.youzi_signal
+        
+        # 判断逻辑
+        if overall >= 70 and boost >= 10 and tech_sig == 'bullish' and youzi_sig == 'bullish':
+            verdict = 'STRONG_BUY'
+        elif overall >= 60 and boost >= 5 and tech_sig in ['bullish', 'neutral']:
+            verdict = 'BUY'
+        elif overall >= 50 and boost >= 0:
+            verdict = 'NEUTRAL'
+        elif overall < 40 or boost < -5:
+            verdict = 'SELL'
+        else:
+            verdict = 'NEUTRAL'
+        
+        return {
+            'verdict': verdict,
+            'score': overall,
+            'boost': boost,
+            'details': {
+                'overall_score': overall,
+                'score_boost': boost,
+                'bullish_count': result.bullish_count,
+                'bearish_count': result.bearish_count,
+                'tech_signal': tech_sig,
+                'youzi_signal': youzi_sig,
+                'value_signal': result.value_signal,
+                'growth_signal': result.growth_signal,
+                'key_risks': result.key_risks,
+                'key_opportunities': result.key_opportunities,
+                'top_bulls': [{'name': b['name'], 'score': b['score'], 'headline': b['headline']} for b in result.top_bulls],
+                'top_bears': [{'name': b['name'], 'score': b['score'], 'headline': b['headline']} for b in result.top_bears],
+            }
+        }
+    except Exception as e:
+        print(f"[UZI全量分析] {code} 失败: {e}")
+        return {
+            'verdict': 'ERROR',
+            'score': 0,
+            'boost': 0,
+            'details': {'error': str(e)}
+        }
+
+
+def quick_uzi_score(code: str, name: str, kline: List[Dict], spot_row: Optional[Dict] = None,
+                    market_sentiment: Optional[Dict] = None) -> Tuple[float, str, List[str]]:
+    """快速获取 UZI 加分和理由（供 strategy.py 直接调用）
+
+    Args:
+        market_sentiment: 来自 data_feed.get_market_sentiment() 的市场情绪数据
+                         包含 limit_up/limit_down/up_ratio 等，用于计算情绪温度
+    """
+    try:
+        analyzer = UZIAnalyzer()
+        result = analyzer.analyze_stock(code, name, kline, spot_row, market_sentiment)
         reasons = []
         if result.tech_signal == 'bullish':
             reasons.append(f"技术派看多({result.bullish_count}人看多)")

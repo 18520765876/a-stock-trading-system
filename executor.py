@@ -26,17 +26,22 @@ class Executor:
         self.today_str = datetime.now().strftime('%Y-%m-%d')
 
     def run_scan(self):
-        """执行一次扫描 - 选股时间点(09:00/14:30)做完整扫描+保存候选池，其他时间只做卖出监控"""
+        """执行一次扫描 - 09:00轻量确认(隔夜验证)/14:30尾盘选股/其他时间仅卖出监控"""
         now = datetime.now()
         time_str = now.strftime('%H:%M')
-        is_picker_time = (time_str == '09:00' or time_str == '14:30')
-
+        
+        # 判断当前时段
+        is_premarket = (time_str == '09:00')
+        is_closing_pick = (time_str == '14:30')
+        
         print(f"\n{'='*60}")
         print(f"[执行器] {now.strftime('%Y-%m-%d %H:%M:%S')} 开始扫描")
         print(f"[执行器] 当前策略版本: v{self.evolver.config.get('version', 1)}")
-        if is_picker_time:
-            source = '盘前选股' if time_str == '09:00' else '尾盘选股'
-            print(f"[执行器] ⭐ 选股时间点: {source}，执行完整扫描并保存候选池")
+        
+        if is_premarket:
+            print(f"[执行器] 🌅 盘前轻量确认：验证昨日盘后候选池有效性")
+        elif is_closing_pick:
+            print(f"[执行器] ⭐ 尾盘选股时间点：执行轻量化扫描")
         else:
             print(f"[执行器] 非选股时间，仅执行卖出监控")
         print(f"{'='*60}")
@@ -49,20 +54,306 @@ class Executor:
         for sig in sell_signals:
             self._execute_sell(sig)
 
-        # 3. 检查买入信号（仅在 09:00 和 14:30 执行选股）
-        if is_picker_time:
+        # 3. 处理买入候选
+        if is_premarket:
+            # 09:00：轻量确认（读取昨日盘后候选池，验证隔夜有效性）
+            self._run_premarket_confirm()
+        elif is_closing_pick:
+            # 14:30：尾盘选股（轻量化扫描）
             buy_signals = self._check_buys()
             for sig in buy_signals:
-                sig.signal_source = source.replace('选股', '票')
-            # 保存候选池到文件（供14:45二次确认使用）
-            self._save_candidates(buy_signals, source)
-            print(f"[执行器] {source}仅保存候选池，不执行盘中买入；唯一买点为14:45尾盘确认")
+                sig.signal_source = '尾盘票'
+            self._save_candidates(buy_signals, '尾盘选股')
+            print(f"[执行器] 尾盘选股仅保存候选池，不执行盘中买入；唯一买点为14:45尾盘确认")
         else:
             print(f"[执行器] 非选股时间，跳过买入扫描")
 
         # 4. 保存状态
         self.account.save()
         print(f"[执行器] 扫描完成，总资产: ¥{self.account.total_asset:,.2f}")
+
+    def _run_premarket_confirm(self):
+        """09:00盘前轻量确认：读取昨日盘后候选池，验证隔夜有效性"""
+        import json, os
+        today_str = datetime.now().strftime('%Y-%m-%d')
+        
+        # 读取昨日盘后候选池
+        candidates_file = f'/tmp/candidates_{today_str}.json'
+        if not os.path.exists(candidates_file):
+            print(f"[盘前确认] ⚠️ 昨日盘后候选池不存在: {candidates_file}")
+            print(f"[盘前确认] 跳过确认，等待14:30尾盘选股")
+            return
+        
+        try:
+            with open(candidates_file, 'r') as f:
+                data = json.load(f)
+        except Exception as e:
+            print(f"[盘前确认] ⚠️ 读取候选池失败: {e}")
+            return
+        
+        # 获取盘后候选股
+        postmarket = data.get('盘后选股(带UZI)', [])
+        if not postmarket:
+            print(f"[盘前确认] ⚠️ 盘后候选池为空")
+            return
+        
+        print(f"[盘前确认] 读取到昨日盘后候选池: {len(postmarket)}只")
+        
+        # 轻量验证：检查隔夜是否有重大利空/公告/异动
+        # 1. 获取今日开盘价对比昨日收盘价
+        spot_df = self.strategy.feed.get_stock_spot()
+        if spot_df.empty:
+            print(f"[盘前确认] ⚠️ 无法获取实时行情，跳过验证")
+            return
+        
+        confirmed = []
+        rejected = []
+        
+        for candidate in postmarket:
+            code = candidate.get('code', '')
+            name = candidate.get('name', '')
+            
+            # 查找今日行情
+            match = spot_df[spot_df['代码'] == code]
+            if match.empty:
+                print(f"[盘前确认] ⚠️ {name}({code}) 无行情数据，保留候选")
+                confirmed.append(candidate)
+                continue
+            
+            row = match.iloc[0]
+            current_price = float(row.get('最新价', 0))
+            yesterday_close = float(row.get('昨收', 0))
+            
+            if yesterday_close <= 0:
+                confirmed.append(candidate)
+                continue
+            
+            # 计算隔夜涨跌幅
+            overnight_change = (current_price - yesterday_close) / yesterday_close * 100
+            
+            # 轻量过滤条件
+            if overnight_change < -5:
+                # 隔夜大跌>5%，可能有利空，剔除
+                rejected.append({**candidate, 'reject_reason': f'隔夜大跌{overnight_change:.1f}%'})
+                print(f"[盘前确认] ❌ {name}({code}) 隔夜大跌{overnight_change:.1f}%，剔除")
+            elif overnight_change > 9:
+                # 隔夜涨停（一字板），无法买入，剔除
+                rejected.append({**candidate, 'reject_reason': f'隔夜涨停{overnight_change:.1f}%'})
+                print(f"[盘前确认] ❌ {name}({code}) 隔夜涨停{overnight_change:.1f}%，无法买入，剔除")
+            else:
+                confirmed.append(candidate)
+                print(f"[盘前确认] ✅ {name}({code}) 隔夜变化{overnight_change:+.1f}%，保留")
+        
+        print(f"[盘前确认] 验证完成: 保留{len(confirmed)}只 / 剔除{len(rejected)}只")
+        
+        # 保存确认后的候选池
+        confirmed_data = {
+            '盘后选股(带UZI)': confirmed,
+            '盘前确认剔除': rejected,
+            'confirmed_at': today_str
+        }
+        with open(candidates_file, 'w') as f:
+            json.dump(confirmed_data, f, ensure_ascii=False, indent=2)
+        
+        # 生成盘前确认报告
+        self._send_premarket_confirm_report(confirmed, rejected, today_str)
+
+    def _send_premarket_confirm_report(self, confirmed, rejected, today_str):
+        """发送盘前确认报告"""
+        lines = [
+            f"🌅 **{today_str} 盘前轻量确认报告**",
+            f"",
+            f"📊 隔夜验证结果:",
+            f"  • 盘后候选: {len(confirmed) + len(rejected)}只",
+            f"  • 验证保留: {len(confirmed)}只",
+            f"  • 验证剔除: {len(rejected)}只",
+            f"",
+        ]
+        
+        if confirmed:
+            lines.append("✅ **保留候选（等待14:45二次确认）:**")
+            for i, c in enumerate(confirmed[:5], 1):
+                uzi_v = c.get('uzi_verdict', 'N/A')
+                formula_str = " | ".join(c.get('formulas', [])) or "无"
+                lines.append(f"{i}. **{c.get('name')}**({c.get('code')}) 原评分:{c.get('score', 0):.0f} UZI:{uzi_v}")
+                lines.append(f"   📝 公式: {formula_str}")
+            if len(confirmed) > 5:
+                lines.append(f"… 其余 {len(confirmed)-5} 只")
+        else:
+            lines.append("⚠️ 无保留候选，等待14:30尾盘选股")
+        
+        if rejected:
+            lines.append("")
+            lines.append("❌ **剔除原因:**")
+            for r in rejected[:3]:
+                lines.append(f"  • {r.get('name')}({r.get('code')}): {r.get('reject_reason', '')}")
+        
+        # 写入微信推送文件
+        wechat_file = f'/tmp/wechat_premarket_{today_str}.md'
+        with open(wechat_file, 'w', encoding='utf-8') as f:
+            f.write('\n'.join(lines))
+        print(f"[盘前确认] 报告已生成: {wechat_file}")
+        
+        # 直接推送
+        self.notifier._send('\n'.join(lines), "text")
+
+    def run_postmarket_pick(self):
+        """盘后选股：17:00执行，完整扫描 + UZI-Skill深度分析 + 保存次日候选池"""
+        now = datetime.now()
+        today_str = now.strftime('%Y-%m-%d')
+        next_date = (now + timedelta(days=1)).strftime('%Y-%m-%d')
+
+        print(f"\n{'='*60}")
+        print(f"[盘后选股] {now.strftime('%Y-%m-%d %H:%M:%S')} 开始盘后选股")
+        print(f"[盘后选股] 当前策略版本: v{self.evolver.config.get('version', 1)}")
+        print(f"[盘后选股] 目标：为 {next_date} 生成候选池（带UZI深度分析）")
+        print(f"{'='*60}")
+
+        # 1. 完整选股扫描（同09:00盘前选股逻辑）
+        buy_signals = self._check_buys()
+        print(f"[盘后选股] 初选候选股: {len(buy_signals)}只")
+
+        if not buy_signals:
+            print(f"[盘后选股] 无候选股，跳过UZI分析")
+            self._save_postmarket_candidates([], today_str, next_date)
+            return
+
+        # 2. UZI-Skill 深度分析（全量pipeline）
+        print(f"[盘后选股] 开始对 {len(buy_signals)} 只候选股执行UZI深度分析...")
+        uzi_passed = []
+        uzi_rejected = []
+
+        for sig in buy_signals:
+            try:
+                from uzi_integration import full_uzi_analysis
+                uzi_result = full_uzi_analysis(
+                    code=sig.code,
+                    name=sig.name,
+                    kline=self.strategy._df_to_kline(self.strategy.feed.get_stock_hist(sig.code, days=60)),
+                    spot_data={
+                        '换手': sig.current_price,  # 需要实际换手率，这里用价格占位
+                        '总市值': 0,
+                    },
+                    market_sentiment=self.strategy.feed.get_market_sentiment()
+                )
+
+                # UZI结果解析
+                uzi_score = uzi_result.get('score', 0)
+                uzi_verdict = uzi_result.get('verdict', 'UNKNOWN')
+                uzi_details = uzi_result.get('details', {})
+
+                # 记录UZI分析结果（用于进化归因）
+                sig.uzi_score = uzi_score
+                sig.uzi_verdict = uzi_verdict
+                sig.uzi_details = uzi_details
+
+                if uzi_verdict in ['STRONG_BUY', 'BUY']:
+                    uzi_passed.append(sig)
+                    print(f"[UZI] ✅ {sig.name}({sig.code}) 通过: {uzi_verdict} 评分:{uzi_score:.1f}")
+                else:
+                    uzi_rejected.append(sig)
+                    print(f"[UZI] ❌ {sig.name}({sig.code}) 否决: {uzi_verdict} 评分:{uzi_score:.1f}")
+
+            except Exception as e:
+                print(f"[UZI] ⚠️ {sig.name}({sig.code}) 分析异常: {e}")
+                # 异常时保守处理：不否决，保留候选
+                uzi_passed.append(sig)
+                sig.uzi_score = 0
+                sig.uzi_verdict = 'ERROR_PASS'
+                sig.uzi_details = {'error': str(e)}
+
+        print(f"[盘后选股] UZI分析完成: 通过{len(uzi_passed)}只 / 否决{len(uzi_rejected)}只")
+
+        # 3. 保存盘后候选池（含UZI结果，供次日使用）
+        self._save_postmarket_candidates(uzi_passed, today_str, next_date, uzi_rejected)
+
+        # 4. 生成盘后选股报告
+        self._send_postmarket_report(uzi_passed, uzi_rejected, today_str, next_date)
+
+        print(f"[盘后选股] 完成，次日候选池已保存")
+
+    def _save_postmarket_candidates(self, passed, today_str, next_date, rejected=None):
+        """保存盘后选股候选池到文件，供次日09:00/14:45使用"""
+        import json, os
+
+        # 主候选池文件
+        filepath = f'/tmp/postmarket_candidates_{today_str}.json'
+        data = {
+            'generated_at': today_str,
+            'for_date': next_date,
+            'passed': [
+                {
+                    'code': s.code, 'name': s.name, 'score': s.score,
+                    'price': s.current_price, 'reasons': s.reasons,
+                    'formulas': s.formulas, 'leader_grade': s.leader_grade,
+                    'leader_score': s.leader_score,
+                    'uzi_score': getattr(s, 'uzi_score', 0),
+                    'uzi_verdict': getattr(s, 'uzi_verdict', ''),
+                    'uzi_details': getattr(s, 'uzi_details', {}),
+                }
+                for s in passed[:10]
+            ],
+            'rejected': [
+                {
+                    'code': s.code, 'name': s.name, 'score': s.score,
+                    'uzi_score': getattr(s, 'uzi_score', 0),
+                    'uzi_verdict': getattr(s, 'uzi_verdict', ''),
+                }
+                for s in (rejected or [])
+            ],
+            'stats': {
+                'total_scanned': len(passed) + len(rejected or []),
+                'uzi_passed': len(passed),
+                'uzi_rejected': len(rejected or []),
+            }
+        }
+
+        with open(filepath, 'w') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        print(f"[盘后选股] 候选池已保存: {filepath}")
+
+        # 同时写入次日通用候选池（供09:00轻量确认和14:45使用）
+        next_day_file = f'/tmp/candidates_{next_date}.json'
+        next_day_data = {'盘后选股(带UZI)': data['passed']}
+        with open(next_day_file, 'w') as f:
+            json.dump(next_day_data, f, ensure_ascii=False, indent=2)
+        print(f"[盘后选股] 次日候选池已写入: {next_day_file}")
+
+    def _send_postmarket_report(self, passed, rejected, today_str, next_date):
+        """发送盘后选股报告"""
+        lines = [
+            f"📋 **{today_str} 盘后选股报告**",
+            f"",
+            f"🎯 为 **{next_date}** 生成候选池",
+            f"",
+            f"📊 UZI深度分析结果:",
+            f"  • 初选候选: {len(passed) + len(rejected)}只",
+            f"  • UZI通过: {len(passed)}只",
+            f"  • UZI否决: {len(rejected)}只",
+            f"",
+        ]
+
+        if passed:
+            lines.append("✅ **UZI通过候选（次日关注）:**")
+            for i, s in enumerate(passed[:5], 1):
+                uzi_v = getattr(s, 'uzi_verdict', 'N/A')
+                uzi_s = getattr(s, 'uzi_score', 0)
+                formula_str = " | ".join(s.formulas) if s.formulas else "无"
+                lines.append(f"{i}. **{s.name}**({s.code}) 评分:{s.score:.0f} UZI:{uzi_v}({uzi_s:.1f})")
+                lines.append(f"   📝 公式: {formula_str} | 👑 {s.leader_grade}")
+            if len(passed) > 5:
+                lines.append(f"… 其余 {len(passed)-5} 只详见候选池文件")
+        else:
+            lines.append("⚠️ 无UZI通过候选，次日建议观望")
+
+        # 写入微信推送文件
+        wechat_file = f'/tmp/wechat_postmarket_{today_str}.md'
+        with open(wechat_file, 'w', encoding='utf-8') as f:
+            f.write('\n'.join(lines))
+        print(f"[盘后选股] 报告已生成: {wechat_file}")
+
+        # 直接推送
+        self.notifier._send('\n'.join(lines), "text")
 
     def _save_candidates(self, signals, source):
         """保存候选池到文件，供14:45二次确认使用；同时生成微信推送文件"""
