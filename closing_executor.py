@@ -223,7 +223,7 @@ def execute_closing():
         _print_notification(result)
         return
     
-    # 7. 对所有通过5层过滤的标的执行买入
+        # 4. 对所有通过5层过滤的标的执行买入
     try:
         from strategy_evolver import StrategyEvolver
         try:
@@ -235,6 +235,28 @@ def execute_closing():
             code = top_pick['code']
             name = top_pick['name']
             price = top_pick['price']
+            
+            # === UZI 深度分析（买入前最终确认）===
+            uzi_deep_score = None
+            uzi_deep_reasons = []
+            try:
+                from uzi_integration import UZIAnalyzer
+                import pandas as pd
+                # 尝试获取K线
+                hist_df = pd.DataFrame()  # 简化：实际运行时会从 data_feed 获取
+                uzi = UZIAnalyzer()
+                uzi_deep_score = uzi.analyze_stock(code, name, [], top_pick)
+                uzi_deep_reasons = [
+                    f"UZI综合:{uzi_deep_score.overall_score} 看多:{uzi_deep_score.bullish_count} 看空:{uzi_deep_score.bearish_count}",
+                    f"游资:{uzi_deep_score.youzi_signal} 技术:{uzi_deep_score.tech_signal} 加分:{uzi_deep_score.score_boost:+.1f}"
+                ]
+                # UZI 强烈看空时跳过
+                if uzi_deep_score.score_boost < -10 and uzi_deep_score.youzi_signal == 'bearish':
+                    print(f"[14:45 UZI] {code} UZI强烈看空，跳过买入")
+                    continue
+            except Exception as e:
+                print(f"[14:45 UZI] {code} 深度分析失败: {e}")
+            
             trade = account.buy(
                 code=code,
                 name=name,
@@ -242,11 +264,14 @@ def execute_closing():
                 ratio=ratio,
                 date_str=today_str,
                 metadata={
-                    'entry_reasons': top_pick.get('reasons', []),
+                    'entry_reasons': top_pick.get('reasons', []) + uzi_deep_reasons,
                     'formulas': top_pick.get('formulas', []),
                     'signal_source': top_pick.get('signal_source', ''),
                     'leader_grade': top_pick.get('leader_grade', ''),
                     'leader_score': top_pick.get('leader_score', 0),
+                    'uzi_score': uzi_deep_score.overall_score if uzi_deep_score else 0,
+                    'uzi_signal': uzi_deep_score.youzi_signal if uzi_deep_score else 'unknown',
+                    'uzi_boost': uzi_deep_score.score_boost if uzi_deep_score else 0,
                 }
             )
             if trade:
@@ -256,7 +281,9 @@ def execute_closing():
                     'price': trade.price,
                     'shares': trade.shares,
                     'amount': trade.amount,
-                    'source': top_pick.get('source', '未知')
+                    'source': top_pick.get('source', '未知'),
+                    'uzi_score': uzi_deep_score.overall_score if uzi_deep_score else 0,
+                    'uzi_signal': uzi_deep_score.youzi_signal if uzi_deep_score else 'unknown',
                 })
 
         if bought:

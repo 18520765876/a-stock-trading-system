@@ -422,6 +422,21 @@ class Strategy:
                 if formula_names and not self._formula_allowed(formula_names, market_mode, sentiment_cycle):
                     continue
 
+                # === UZI 集成：51位投资大佬评审 ===
+                uzi_bonus = 0
+                uzi_reasons = []
+                try:
+                    from uzi_integration import quick_uzi_score
+                    uzi_boost, uzi_signal, uzi_reasons = quick_uzi_score(
+                        code, name, self._df_to_kline(hist) if not hist.empty else [],
+                        {'换手': float(row.get('换手', 0)), '总市值': float(row.get('总市值', 0))}
+                    )
+                    uzi_bonus = uzi_boost
+                    if uzi_reasons:
+                        tech_reasons.append(f"UZI评审: {', '.join(uzi_reasons[:2])}")
+                except Exception as e:
+                    print(f"[UZI] {code} 评分失败: {e}")
+
                 # 公式加分
                 formula_bonus = 0
                 if formula_sigs:
@@ -442,7 +457,7 @@ class Strategy:
                 if not gate_ok:
                     continue
 
-                total_score = tech_score + fund_score + sector_bonus + formula_bonus + leader_bonus + len(greens)
+                total_score = tech_score + fund_score + sector_bonus + formula_bonus + leader_bonus + len(greens) + uzi_bonus
                 threshold = cfg['buy_score_threshold_defense'] if market_mode == 'defense' else cfg['buy_score_threshold']
 
                 if total_score >= threshold:
@@ -451,6 +466,8 @@ class Strategy:
                     reasons.extend([f"黄色: {x}" for x in yellows])
                     reasons.extend([f"绿色: {x}" for x in greens])
                     reasons.append(f"市场模式: {market_mode} / 情绪周期: {sentiment_cycle} / 模式分:{market_score}")
+                    if uzi_bonus != 0:
+                        reasons.append(f"UZI加分: {uzi_bonus:+.1f} (游资:{uzi_signal})")
                     if sector_bonus > 0:
                         reasons.append("属于当日热点板块")
 
