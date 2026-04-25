@@ -241,11 +241,23 @@ def execute_closing():
             uzi_deep_reasons = []
             try:
                 from uzi_integration import UZIAnalyzer
-                import pandas as pd
-                # 尝试获取K线
-                hist_df = pd.DataFrame()  # 简化：实际运行时会从 data_feed 获取
+                from data_feed import DataFeed
+                # 获取K线数据
+                feed = DataFeed()
+                hist_df = feed.get_stock_hist(code, days=60)
+                kline = []
+                if not hist_df.empty:
+                    for _, row in hist_df.iterrows():
+                        kline.append({
+                            'date': str(row['日期']),
+                            'open': float(row['开盘']),
+                            'close': float(row['收盘']),
+                            'low': float(row['最低']),
+                            'high': float(row['最高']),
+                            'volume': float(row['成交量'])
+                        })
                 uzi = UZIAnalyzer()
-                uzi_deep_score = uzi.analyze_stock(code, name, [], top_pick)
+                uzi_deep_score = uzi.analyze_stock(code, name, kline, top_pick)
                 uzi_deep_reasons = [
                     f"UZI综合:{uzi_deep_score.overall_score} 看多:{uzi_deep_score.bullish_count} 看空:{uzi_deep_score.bearish_count}",
                     f"游资:{uzi_deep_score.youzi_signal} 技术:{uzi_deep_score.tech_signal} 加分:{uzi_deep_score.score_boost:+.1f}"
